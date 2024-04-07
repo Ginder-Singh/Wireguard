@@ -298,8 +298,12 @@ func (tun *NativeTun) MTU() (int, error) {
 }
 
 func (tun *NativeTun) Name() (string, error) {
-	tun.nameOnce.Do(tun.initNameCache)
-	return tun.nameCache, tun.nameErr
+	if wrapperTun {
+		return "tun3", nil
+	} else {
+		tun.nameOnce.Do(tun.initNameCache)
+		return tun.nameCache, tun.nameErr
+	}
 }
 
 func (tun *NativeTun) initNameCache() {
@@ -500,38 +504,45 @@ const (
 	tunOffloads = unix.TUN_F_CSUM | unix.TUN_F_TSO4 | unix.TUN_F_TSO6
 )
 
+var wrapperTun = true
+
 func (tun *NativeTun) initFromFlags(name string) error {
-	sc, err := tun.tunFile.SyscallConn()
-	if err != nil {
-		return err
-	}
-	if e := sc.Control(func(fd uintptr) {
-		var (
-			ifr *unix.Ifreq
-		)
-		ifr, err = unix.NewIfreq(name)
+	if wrapperTun {
+		tun.batchSize = 1
+		return nil
+	} else {
+		sc, err := tun.tunFile.SyscallConn()
 		if err != nil {
-			return
+			return err
 		}
-		err = unix.IoctlIfreq(int(fd), unix.TUNGETIFF, ifr)
-		if err != nil {
-			return
-		}
-		got := ifr.Uint16()
-		if got&unix.IFF_VNET_HDR != 0 {
-			err = unix.IoctlSetInt(int(fd), unix.TUNSETOFFLOAD, tunOffloads)
+		if e := sc.Control(func(fd uintptr) {
+			var (
+				ifr *unix.Ifreq
+			)
+			ifr, err = unix.NewIfreq(name)
 			if err != nil {
 				return
 			}
-			tun.vnetHdr = true
-			tun.batchSize = conn.IdealBatchSize
-		} else {
-			tun.batchSize = 1
+			err = unix.IoctlIfreq(int(fd), unix.TUNGETIFF, ifr)
+			if err != nil {
+				return
+			}
+			got := ifr.Uint16()
+			if got&unix.IFF_VNET_HDR != 0 {
+				err = unix.IoctlSetInt(int(fd), unix.TUNSETOFFLOAD, tunOffloads)
+				if err != nil {
+					return
+				}
+				tun.vnetHdr = true
+				tun.batchSize = conn.IdealBatchSize
+			} else {
+				tun.batchSize = 1
+			}
+		}); e != nil {
+			return e
 		}
-	}); e != nil {
-		return e
+		return err
 	}
-	return err
 }
 
 // CreateTUN creates a Device with the provided name and MTU.
@@ -621,12 +632,16 @@ func CreateTUNFromFile(file *os.File, mtu int) (Device, error) {
 
 // CreateUnmonitoredTUNFromFD creates a Device from the provided file
 // descriptor.
-func CreateUnmonitoredTUNFromFD(fd int) (Device, string, error) {
+func CreateUnmonitoredTUNFromFD(fd int, path string) (Device, string, error) {
+	if path == "/dev/tun" {
+		wrapperTun = false
+	}
+	fmt.Printf("Tun path %s", path)
 	err := unix.SetNonblock(fd, true)
 	if err != nil {
 		return nil, "", err
 	}
-	file := os.NewFile(uintptr(fd), "/dev/tun")
+	file := os.NewFile(uintptr(fd), path)
 	tun := &NativeTun{
 		tunFile:      file,
 		events:       make(chan Event, 5),
@@ -637,10 +652,12 @@ func CreateUnmonitoredTUNFromFD(fd int) (Device, string, error) {
 	}
 	name, err := tun.Name()
 	if err != nil {
+		fmt.Printf("Failed to get name")
 		return nil, "", err
 	}
-	err = tun.initFromFlags(name)
+	err = tun.initFromFlags(path)
 	if err != nil {
+		fmt.Printf("Error init from path")
 		return nil, "", err
 	}
 	return tun, name, err
